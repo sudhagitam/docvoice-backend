@@ -1,6 +1,7 @@
 """
 DocVoice AI – Document Extractor
-Handles PDF and DOCX text extraction with automatic OCR fallback for scanned PDFs.
+Handles PDF and DOCX text extraction with automatic OCR fallback.
+Supports Telugu, English, and 10 other languages.
 """
 
 import io
@@ -10,16 +11,41 @@ from pathlib import Path
 
 logger = logging.getLogger("docvoice.extractor")
 
+# Tesseract language codes for OCR
+TESSERACT_LANG_MAP = {
+    "en": "eng",
+    "te": "tel",  # Telugu
+    "hi": "hin",
+    "es": "spa",
+    "fr": "fra",
+    "de": "deu",
+    "it": "ita",
+    "pt": "por",
+    "ar": "ara",
+    "ru": "rus",
+    "zh": "chi_sim",
+    "ja": "jpn",
+    "ko": "kor",
+}
+
+# Default OCR language chain — eng+tel gives best results for mixed docs
+DEFAULT_OCR_LANG = "eng+tel"
+
 
 class DocumentExtractor:
     """Extracts plain text from PDF and DOCX files."""
 
     SUPPORTED = {".pdf", ".docx"}
 
-    def extract(self, file_bytes: bytes, filename: str) -> str:
+    def extract(self, file_bytes: bytes, filename: str, lang: str = "en") -> str:
         """
         Extract text from file_bytes.
         Automatically uses OCR for scanned PDFs.
+
+        Args:
+            file_bytes: Raw file content
+            filename:   Original filename
+            lang:       Language hint for OCR (BCP-47 code e.g. 'en', 'te')
         """
         from core.exceptions import (
             CorruptedFileError,
@@ -31,11 +57,11 @@ class DocumentExtractor:
         if ext not in self.SUPPORTED:
             raise UnsupportedFileTypeError(ext)
 
-        logger.info("Extracting '%s' (%d bytes)", filename, len(file_bytes))
+        logger.info("Extracting '%s' (%d bytes) lang=%s", filename, len(file_bytes), lang)
 
         try:
             if ext == ".pdf":
-                text = self._extract_pdf(file_bytes)
+                text = self._extract_pdf(file_bytes, lang)
             else:
                 text = self._extract_docx(file_bytes)
         except (UnsupportedFileTypeError, EmptyDocumentError, CorruptedFileError):
@@ -54,7 +80,7 @@ class DocumentExtractor:
 
     # ── PDF ───────────────────────────────────────────────────────────────────
 
-    def _extract_pdf(self, data: bytes) -> str:
+    def _extract_pdf(self, data: bytes, lang: str = "en") -> str:
         from core.exceptions import CorruptedFileError
 
         try:
@@ -78,50 +104,48 @@ class DocumentExtractor:
                 logger.warning("Failed to extract page %d; skipping.", i + 1)
 
         text = "\n".join(parts)
-
-        # Always try OCR if text is empty or very sparse (scanned PDF)
         total_pages = len(reader.pages)
         avg_chars = len(text.strip()) / max(total_pages, 1)
 
-        if avg_chars < 50:  # Less than 50 chars per page = likely scanned
+        # Auto-detect scanned PDF: less than 50 chars per page average
+        if avg_chars < 50:
             logger.info(
-                "Sparse text (%.0f chars/page avg) — running OCR on all pages",
-                avg_chars,
+                "Sparse text detected (%.0f chars/page) — running OCR (lang=%s)",
+                avg_chars, lang,
             )
-            ocr_text = self._ocr_pdf(data)
+            ocr_text = self._ocr_pdf(data, lang)
             if len(ocr_text.strip()) > len(text.strip()):
-                logger.info("OCR produced better results: %d chars", len(ocr_text))
                 text = ocr_text
 
         return text
 
-    def _ocr_pdf(self, data: bytes) -> str:
-        """OCR using pdf2image + pytesseract."""
+    def _ocr_pdf(self, data: bytes, lang: str = "en") -> str:
+        """OCR using pdf2image + pytesseract with language support."""
         try:
             import pytesseract
             from pdf2image import convert_from_bytes
-            from PIL import Image
 
-            logger.info("Starting OCR on PDF (%d bytes)…", len(data))
+            # Build tesseract language string
+            tess_lang = self._get_tess_lang(lang)
+            logger.info("Starting OCR: lang=%s tesseract=%s", lang, tess_lang)
 
-            # Convert PDF pages to images
             images = convert_from_bytes(
                 data,
-                dpi=200,          # Good quality vs speed balance
+                dpi=200,
                 fmt="jpeg",
                 thread_count=2,
             )
 
-            logger.info("OCR: converted %d pages to images", len(images))
+            logger.info("OCR: %d pages to process", len(images))
 
             parts = []
             for i, img in enumerate(images):
-                logger.debug("OCR: processing page %d/%d", i + 1, len(images))
-                page_text = pytesseract.image_to_string(img, lang="eng")
+                logger.debug("OCR page %d/%d", i + 1, len(images))
+                page_text = pytesseract.image_to_string(img, lang=tess_lang)
                 parts.append(page_text)
 
             result = "\n".join(parts)
-            logger.info("OCR complete: %d characters extracted", len(result))
+            logger.info("OCR complete: %d characters", len(result))
             return result
 
         except ImportError as exc:
@@ -130,6 +154,28 @@ class DocumentExtractor:
         except Exception as exc:
             logger.warning("OCR failed: %s", exc)
             return ""
+
+    def _get_tess_lang(self, lang: str) -> str:
+        """
+        Convert BCP-47 language code to tesseract lang string.
+        Always includes English as fallback for mixed documents.
+        Telugu always paired with English for best results.
+        """
+        tess = TESSERACT_LANG_MAP.get(lang, "eng")
+
+        # Telugu: always pair with English (mixed docs common)
+        if tess == "tel":
+            return "tel+eng"
+
+        # Hindi: pair with English
+        if tess == "hin":
+            return "hin+eng"
+
+        # For other non-English languages, add eng as fallback
+        if tess != "eng":
+            return f"{tess}+eng"
+
+        return tess
 
     # ── DOCX ──────────────────────────────────────────────────────────────────
 

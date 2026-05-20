@@ -1,11 +1,10 @@
 """
 DocVoice AI – API Routes (Cloud Run)
-Supports files up to 100 MB with extended timeouts.
+Supports files up to 100 MB, Telugu OCR, 12 languages.
 """
 
 import logging
 import os
-import traceback
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -13,7 +12,7 @@ from fastapi.responses import JSONResponse, Response
 
 from core.config import settings
 from core.exceptions import DocVoiceError
-from core.extractor import DocumentExtractor
+from core.extractor import DocumentExtractor, TESSERACT_LANG_MAP
 from core.tts_engine import ENGLISH_ACCENTS, SUPPORTED_LANGUAGES, TTSEngine
 
 logger = logging.getLogger("docvoice.routes")
@@ -36,46 +35,42 @@ async def list_languages():
     return {
         "languages": SUPPORTED_LANGUAGES,
         "english_accents": ENGLISH_ACCENTS,
+        "ocr_languages": list(TESSERACT_LANG_MAP.keys()),
     }
 
 
 # ── Extract ───────────────────────────────────────────────────────────────────
 
 @router.post("/extract")
-async def extract_text(file: Annotated[UploadFile, File()]):
-    """Extract text from PDF or DOCX – no audio generated."""
+async def extract_text(
+    file: Annotated[UploadFile, File()],
+    lang: Annotated[str, Form()] = "en",
+):
     file_bytes = await file.read()
-
     size_mb = len(file_bytes) / (1024 * 1024)
-    logger.info("Extract request: %s (%.1f MB)", file.filename, size_mb)
+    logger.info("Extract: %s (%.1f MB) lang=%s", file.filename, size_mb, lang)
 
     if len(file_bytes) > settings.MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            413,
-            f"File is {size_mb:.1f} MB. Limit is "
-            f"{settings.MAX_UPLOAD_BYTES // (1024*1024)} MB.",
-        )
-
+        raise HTTPException(413, f"File is {size_mb:.1f} MB. Limit is "
+                                 f"{settings.MAX_UPLOAD_BYTES // (1024*1024)} MB.")
     try:
-        text = extractor.extract(file_bytes, file.filename or "upload")
+        text = extractor.extract(file_bytes, file.filename or "upload", lang=lang)
     except DocVoiceError as exc:
         return _err(exc)
     except Exception as exc:
         logger.exception("Unexpected extract error")
-        raise HTTPException(500, f"Extract failed: {exc}") from exc
+        raise HTTPException(500, str(exc)) from exc
 
     preview = text[: settings.MAX_TEXT_CHARS]
-    truncated = len(text) > settings.MAX_TEXT_CHARS
-
     return {
         "filename": file.filename,
         "char_count": len(text),
-        "truncated": truncated,
+        "truncated": len(text) > settings.MAX_TEXT_CHARS,
         "text": preview,
     }
 
 
-# ── Synthesize (file upload) ──────────────────────────────────────────────────
+# ── Synthesize ────────────────────────────────────────────────────────────────
 
 @router.post("/synthesize")
 async def synthesize(
@@ -84,38 +79,26 @@ async def synthesize(
     tld:  Annotated[str, Form()] = "com",
     slow: Annotated[bool, Form()] = False,
 ):
-    """
-    Upload PDF/DOCX → receive MP3.
-    Supports files up to 100 MB on Cloud Run.
-    """
     file_bytes = await file.read()
     size_mb = len(file_bytes) / (1024 * 1024)
-    logger.info("Synthesize request: %s (%.1f MB) lang=%s", file.filename, size_mb, lang)
+    logger.info("Synthesize: %s (%.1f MB) lang=%s", file.filename, size_mb, lang)
 
     if len(file_bytes) > settings.MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            413,
-            f"File is {size_mb:.1f} MB. Limit is "
-            f"{settings.MAX_UPLOAD_BYTES // (1024*1024)} MB.",
-        )
+        raise HTTPException(413, f"File is {size_mb:.1f} MB. Limit is "
+                                 f"{settings.MAX_UPLOAD_BYTES // (1024*1024)} MB.")
 
-    # 1. Extract text
+    # Extract text (pass lang for OCR)
     try:
-        text = extractor.extract(file_bytes, file.filename or "upload")
+        text = extractor.extract(file_bytes, file.filename or "upload", lang=lang)
     except DocVoiceError as exc:
         return _err(exc)
     except Exception as exc:
         logger.exception("Extract error")
         raise HTTPException(500, f"Text extraction failed: {exc}") from exc
 
-    # 2. Truncate if needed
-    if len(text) > settings.MAX_TEXT_CHARS:
-        logger.info(
-            "Truncating text: %d → %d chars", len(text), settings.MAX_TEXT_CHARS
-        )
-        text = text[: settings.MAX_TEXT_CHARS]
+    text = text[: settings.MAX_TEXT_CHARS]
 
-    # 3. Synthesize
+    # Synthesize audio
     try:
         engine = TTSEngine(lang=lang, slow=slow, tld=tld)
         mp3_bytes = engine.synthesize(text)
@@ -126,8 +109,6 @@ async def synthesize(
         raise HTTPException(500, f"TTS failed: {exc}") from exc
 
     base = os.path.splitext(file.filename or "document")[0]
-    logger.info("Returning MP3: %d bytes", len(mp3_bytes))
-
     return Response(
         content=mp3_bytes,
         media_type="audio/mpeg",
@@ -138,7 +119,7 @@ async def synthesize(
     )
 
 
-# ── Synthesize (raw text) ─────────────────────────────────────────────────────
+# ── Synthesize raw text ───────────────────────────────────────────────────────
 
 @router.post("/synthesize-text")
 async def synthesize_text(
@@ -147,12 +128,9 @@ async def synthesize_text(
     tld:  Annotated[str, Form()] = "com",
     slow: Annotated[bool, Form()] = False,
 ):
-    """Convert raw text to MP3 (no file upload)."""
     if not text.strip():
-        raise HTTPException(422, "Text cannot be empty.")
-
+        raise HTTPException(422, "Text is empty.")
     text = text[: settings.MAX_TEXT_CHARS]
-
     try:
         engine = TTSEngine(lang=lang, slow=slow, tld=tld)
         mp3_bytes = engine.synthesize(text)
